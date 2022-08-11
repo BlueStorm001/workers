@@ -58,16 +58,11 @@ func New(worker int) *Dispatcher {
 func NewWorkerQueue(maxQueue, maxWorker int) *Dispatcher {
 	dispatcher := newDispatcher(maxWorker)
 	dispatcher.JobQueue = queue.New[Job](maxQueue)
-	//in := make(chan Job, maxQueue)
-	//out := make(chan Job, maxQueue)
-	//dispatcher.ch = &channel{InJob: in, OutJob: out, data: queue.New[Job]()}
-	//go dispatcher.process(in, out)
 	return dispatcher
 }
 
 //生成调度器
 func newDispatcher(maxWorkers int) *Dispatcher {
-	//pool := make(chan chan Job, maxWorkers)
 	return &Dispatcher{MaxWorkers: maxWorkers}
 }
 
@@ -154,10 +149,6 @@ func WaitAll(workers ...*Dispatcher) bool {
 
 // Run 启动调度器
 func (d *Dispatcher) Run() *Dispatcher {
-	//for i := 0; i < d.MaxWorkers; i++ {
-	//	w := newWorker(d.WorkerPool)
-	//	go w.start(d)
-	//}
 	if !d.run {
 		d.rm.Lock()
 		if !d.run {
