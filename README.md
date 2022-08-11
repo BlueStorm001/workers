@@ -4,12 +4,6 @@
 也可作用于 goroutine 池，是 ants 的10倍
 
 ``` golang
-const (
-	BenchParam         = 10
-	BenchAntsSize      = 200000
-	DefaultExpiredTime = 10 * time.Second
-)
-
 var workers = New(10000)
 
 //cpu: Intel(R) Core(TM) i7-1068NG7 CPU @ 2.30GHz
@@ -22,6 +16,12 @@ func BenchmarkWorkers(b *testing.B) {
 		})
 	}
 }
+
+const (
+	BenchParam         = 10
+	BenchAntsSize      = 200000
+	DefaultExpiredTime = 10 * time.Second
+)
 
 var antsPool, _ = ants.NewPool(BenchAntsSize, ants.WithExpiryDuration(DefaultExpiredTime))
 
