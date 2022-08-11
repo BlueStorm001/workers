@@ -1,7 +1,7 @@
 # workers
 高性能多任务工作者队列，队列支持自动扩容
 
-也可作用于 goroutine 池，是 ants 的10倍
+也可作用于 goroutine 池，来提高性能
 
 ``` golang
 var workers = New(10000)
