@@ -23,8 +23,9 @@
 package workers
 
 import (
-	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 	"workers/queue"
 )
@@ -33,49 +34,64 @@ type Job interface {
 	ToWork() error
 }
 
+type worker struct {
+	task chan Job
+}
+
 type Dispatcher struct {
-	MaxWorkers int               //最大工人数
+	MaxWorkers int32             //最大工人数
 	JobQueue   *queue.Queue[Job] //工作队列
-	JobTotal   int               //工作数量
+	JobTotal   int32             //工作数量
 	Timeout    time.Duration     //超时时间
-	tally      sync.Mutex
+	pool       sync.Pool         //sync.Pool
+	wait       chan bool
+	locker     sync.Mutex
 	quit       chan bool
 	complete   chan bool
+	started    bool
 	stop       bool
+	running    int32 //执行中
+	ready      bool
+	lock       sync.Mutex
 	mu         sync.Mutex
-	run        bool
-	rm         sync.Mutex
-	executions int //执行中
+	alive      int32
+}
+
+// Default 获取一个默认配置的工作者对象，取得最佳效果
+func Default() *Dispatcher {
+	return NewWorkerQueue(1000, 30000) //math.MaxInt32
 }
 
 // New 声明一个工作者，队列自动扩容
-func New(worker int) *Dispatcher {
+func New(worker int32) *Dispatcher {
 	d := NewWorkerQueue(1000, worker)
 	return d
 }
 
 // NewWorkerQueue 获得工人工作队列的调度器并直接启动
-func NewWorkerQueue(maxQueue, maxWorker int) *Dispatcher {
+func NewWorkerQueue(maxQueue, maxWorker int32) *Dispatcher {
 	dispatcher := newDispatcher(maxWorker)
-	dispatcher.JobQueue = queue.New[Job](maxQueue)
+	dispatcher.JobQueue = queue.New[Job](int(maxQueue))
+	dispatcher.wait = make(chan bool, 1)
+	dispatcher.pool.New = func() any {
+		return &worker{}
+	}
 	return dispatcher
 }
 
 //生成调度器
-func newDispatcher(maxWorkers int) *Dispatcher {
+func newDispatcher(maxWorkers int32) *Dispatcher {
 	return &Dispatcher{MaxWorkers: maxWorkers}
 }
 
-func (d *Dispatcher) WorkerTotal() int {
+func (d *Dispatcher) WorkerTotal() int32 {
 	return d.MaxWorkers
 }
 
 // Add 添加工作
 func (d *Dispatcher) Add(job Job) (check bool) {
 	if check = d.JobQueue.Push(job); check {
-		d.tally.Lock()
-		d.JobTotal++
-		d.tally.Unlock()
+		d.incTotal()
 		d.Run()
 	}
 	return
@@ -86,18 +102,9 @@ func (d *Dispatcher) Submit(f func()) {
 	d.Add(event{f: f})
 }
 
-type event struct {
-	f func()
-}
-
-func (e event) ToWork() error {
-	e.f()
-	return nil
-}
-
 // Wait 等待结果完成 timeout 超时时间
 func (d *Dispatcher) Wait(timeout ...time.Duration) bool {
-	if d.JobTotal == 0 {
+	if d.Total() == 0 {
 		return false
 	}
 	d.mu.Lock()
@@ -149,14 +156,14 @@ func WaitAll(workers ...*Dispatcher) bool {
 
 // Run 启动调度器
 func (d *Dispatcher) Run() *Dispatcher {
-	if !d.run {
-		d.rm.Lock()
-		if !d.run {
-			d.run = true
+	if !d.started {
+		d.lock.Lock()
+		if !d.started {
+			d.started = true
 			//调度器开始工作
 			go d.dispatch()
 		}
-		d.rm.Unlock()
+		d.lock.Unlock()
 	}
 	return d
 }
@@ -177,48 +184,126 @@ func (d *Dispatcher) Stop() *Dispatcher {
 	return d
 }
 
+// Running 获取当前执行数量
+func (d *Dispatcher) Running() int32 {
+	return atomic.LoadInt32(&d.running)
+}
+
+// Total 获取当前任务总数
+func (d *Dispatcher) Total() int32 {
+	return atomic.LoadInt32(&d.JobTotal)
+}
+
+// Alive 获取当前工作工人数量
+func (d *Dispatcher) Alive() int32 {
+	return atomic.LoadInt32(&d.alive)
+}
+
 //调度
 func (d *Dispatcher) dispatch() {
+	defer func() {
+		d.started = false
+	}()
 	for {
-		//工作饱和
-		if d.executions >= d.MaxWorkers {
-			time.Sleep(time.Millisecond * 10)
-			continue
-		}
 		//获取工作
 		job := d.JobQueue.Pop()
 		//没有工作内容，停止工作调度
 		if job == nil {
-			d.run = false
 			return
 		}
-		d.tally.Lock()
-		d.executions++
-		d.tally.Unlock()
-		go func(w Job) {
-			defer func() {
-				if r := recover(); r != nil {
-					fmt.Println(r)
-				}
-			}()
+		if d.Running() >= d.MaxWorkers {
+			d.ready = true
+			<-d.wait
+		}
+		d.incRunning()
+		w := d.pool.Get().(*worker)
+		if w.task == nil {
+			d.run(w)
+		}
+		w.task <- job
+	}
+}
+
+func (d *Dispatcher) run(w *worker) {
+	w.task = make(chan Job, 1)
+	d.incAlive()
+	go func() {
+		defer func() {
+			w.task = nil
+			d.pool.Put(w)
+			d.decRunning()
+			d.decAlive()
+			if r := recover(); r != nil {
+				log.Println("work exception", r)
+			}
+		}()
+		for t := range w.task {
 			if !d.stop {
-				w.ToWork()
+				if err := t.ToWork(); err != nil {
+					log.Println("work error", err)
+				}
 			}
-			d.tally.Lock()
-			d.executions--
-			if d.executions < 0 {
-				d.executions = 0
+			//完成工作
+			d.pool.Put(w)
+			//准备
+			if d.decRunning() < d.MaxWorkers {
+				if d.ready {
+					d.locker.Lock()
+					if d.ready {
+						d.ready = false
+						d.wait <- true
+					}
+					d.locker.Unlock()
+				}
 			}
-			d.JobTotal--
-			if d.JobTotal <= 0 {
-				d.JobTotal = 0
+			if d.decTotal() == 0 {
 				if d.stop {
 					d.quit <- true
 				} else if d.complete != nil {
 					d.complete <- false
 				}
 			}
-			d.tally.Unlock()
-		}(job)
-	}
+		}
+	}()
+}
+
+func (d *Dispatcher) incRunning() int32 {
+	return atomic.AddInt32(&d.running, 1)
+}
+
+func (d *Dispatcher) decRunning() int32 {
+	return atomic.AddInt32(&d.running, -1)
+}
+
+func (d *Dispatcher) incTotal() int32 {
+	return atomic.AddInt32(&d.JobTotal, 1)
+}
+
+func (d *Dispatcher) decTotal() int32 {
+	return atomic.AddInt32(&d.JobTotal, -1)
+}
+
+//func (d *Dispatcher) incLocker() {
+//	atomic.StoreInt32(&d.locker, 1)
+//}
+//
+//func (d *Dispatcher) decLocker() {
+//	atomic.StoreInt32(&d.locker, 0)
+//}
+
+func (d *Dispatcher) incAlive() int32 {
+	return atomic.AddInt32(&d.alive, 1)
+}
+
+func (d *Dispatcher) decAlive() int32 {
+	return atomic.AddInt32(&d.alive, -1)
+}
+
+type event struct {
+	f func()
+}
+
+func (e event) ToWork() error {
+	e.f()
+	return nil
 }

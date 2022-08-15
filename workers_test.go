@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-var workers = New(10000).Run()
+var workers = New(10)
 
 type tester struct {
 	name string
